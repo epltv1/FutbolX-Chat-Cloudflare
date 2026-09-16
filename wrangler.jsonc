@@ -1,13 +1,13 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "futbolx-chat",
+  "name": "futbolx-chat-cloudflare",
   "main": "src/index.js",
   "compatibility_date": "2026-09-16",
 
   "durable_objects": {
     "bindings": [
       {
-        "name": "futbolx-chat-cloudflare",
+        "name": "CHAT_ROOMS",
         "class_name": "FutbolXChatRoom"
       },
       {
