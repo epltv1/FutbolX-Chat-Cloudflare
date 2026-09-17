@@ -9,21 +9,19 @@ export class FutbolXChatRoom extends DurableObject {
     this.env = env;
     this.sql = ctx.storage.sql;
 
-    this.lastMessageTimes = new Map();
-
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS room_settings (
         event_id TEXT PRIMARY KEY,
         is_closed INTEGER NOT NULL DEFAULT 0,
         slow_mode INTEGER NOT NULL DEFAULT 0,
         announcement TEXT,
-        pinned_message_id TEXT
+        pinned_message_id INTEGER
       )
     `);
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS messages (
-        id TEXT PRIMARY KEY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT NOT NULL,
         message TEXT NOT NULL,
         event_id TEXT NOT NULL,
@@ -31,53 +29,30 @@ export class FutbolXChatRoom extends DurableObject {
         is_mod INTEGER NOT NULL DEFAULT 0,
         reply_to_username TEXT,
         reply_to_msg TEXT,
-        reply_to_id TEXT,
-        created_at TEXT NOT NULL
+        reply_to_id INTEGER,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
     this.sql.exec(`
-      CREATE INDEX IF NOT EXISTS idx_messages_event_created
-      ON messages(event_id, created_at)
+      CREATE INDEX IF NOT EXISTS idx_messages_event
+      ON messages(event_id, id)
     `);
   }
-
-
-  /* =========================================
-     HTTP
-  ========================================= */
 
   async fetch(request) {
 
     const url = new URL(request.url);
+    const eventID =
+      url.searchParams.get("event")?.trim() || "unknown";
 
     if (
-      request.method === "GET" &&
-      url.pathname === "/ws"
+      request.method !== "GET" ||
+      request.headers.get("Upgrade")?.toLowerCase() !== "websocket"
     ) {
-      return this.handleWebSocket(request);
-    }
-
-    return new Response("FutbolX Chat Room", {
-      status: 200
-    });
-  }
-
-
-  /* =========================================
-     WEBSOCKET CONNECTION
-  ========================================= */
-
-  async handleWebSocket(request) {
-
-    if (
-      request.headers.get("Upgrade")?.toLowerCase() !==
-      "websocket"
-    ) {
-      return new Response(
-        "WebSocket upgrade required",
-        { status: 426 }
-      );
+      return new Response("WebSocket upgrade required", {
+        status: 426
+      });
     }
 
     const pair = new WebSocketPair();
@@ -85,33 +60,37 @@ export class FutbolXChatRoom extends DurableObject {
     const client = pair[0];
     const server = pair[1];
 
-    const url = new URL(request.url);
-
-    const eventID =
-      url.searchParams.get("event") || "lobby";
+    /*
+     * IMPORTANT:
+     * Accept the WebSocket BEFORE serializeAttachment().
+     * This is required for the Hibernation WebSocket API.
+     */
+    this.ctx.acceptWebSocket(server);
 
     server.serializeAttachment({
       eventID,
-      connectedAt: Date.now(),
-      username: null
+      username: null,
+      authenticated: false,
+      lastMessageAt: 0
     });
 
-    this.ctx.acceptWebSocket(server);
+    this.ensureRoom(eventID);
 
-    const settings =
-      this.getRoomSettings(eventID);
+    try {
+      this.send(server, {
+        type: "room_init",
+        event_id: eventID,
+        settings: this.getSettings(eventID),
+        messages: this.getMessages(eventID),
+        viewers: this.viewerCount()
+      });
+    } catch (error) {
+      console.error("Initial room setup error:", error);
 
-    const messages =
-      this.getMessages(eventID);
-
-    server.send(JSON.stringify({
-      type: "room_init",
-      eventID,
-      settings,
-      messages
-    }));
-
-    this.broadcastPresence();
+      try {
+        server.close(1011, "Room initialization failed");
+      } catch {}
+    }
 
     return new Response(null, {
       status: 101,
@@ -119,14 +98,34 @@ export class FutbolXChatRoom extends DurableObject {
     });
   }
 
+  ensureRoom(eventID) {
 
-  /* =========================================
-     ROOM SETTINGS
-  ========================================= */
+    const existing = this.sql.exec(`
+      SELECT event_id
+      FROM room_settings
+      WHERE event_id = ?
+      LIMIT 1
+    `, eventID).toArray();
 
-  getRoomSettings(eventID) {
+    if (!existing.length) {
+      this.sql.exec(`
+        INSERT INTO room_settings (
+          event_id,
+          is_closed,
+          slow_mode,
+          announcement,
+          pinned_message_id
+        )
+        VALUES (?, 0, 0, NULL, NULL)
+      `, eventID);
+    }
+  }
 
-    const rows = this.sql.exec(`
+  getSettings(eventID) {
+
+    this.ensureRoom(eventID);
+
+    return this.sql.exec(`
       SELECT
         event_id,
         is_closed,
@@ -136,137 +135,64 @@ export class FutbolXChatRoom extends DurableObject {
       FROM room_settings
       WHERE event_id = ?
       LIMIT 1
-    `, eventID).toArray();
-
-    if (!rows.length) {
-      return {
-        event_id: eventID,
-        is_closed: false,
-        slow_mode: 0,
-        announcement: null,
-        pinned_message_id: null
-      };
-    }
-
-    const row = rows[0];
-
-    return {
-      event_id: row.event_id,
-      is_closed: !!row.is_closed,
-      slow_mode: Number(row.slow_mode || 0),
-      announcement: row.announcement,
-      pinned_message_id: row.pinned_message_id
-    };
+    `, eventID).toArray()[0];
   }
-
-
-  saveRoomSettings(eventID, settings) {
-
-    const current =
-      this.getRoomSettings(eventID);
-
-    const next = {
-      ...current,
-      ...settings
-    };
-
-    this.sql.exec(`
-      INSERT INTO room_settings (
-        event_id,
-        is_closed,
-        slow_mode,
-        announcement,
-        pinned_message_id
-      )
-      VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(event_id)
-      DO UPDATE SET
-        is_closed = excluded.is_closed,
-        slow_mode = excluded.slow_mode,
-        announcement = excluded.announcement,
-        pinned_message_id = excluded.pinned_message_id
-    `,
-      eventID,
-      next.is_closed ? 1 : 0,
-      Number(next.slow_mode || 0),
-      next.announcement || null,
-      next.pinned_message_id || null
-    );
-
-    return this.getRoomSettings(eventID);
-  }
-
-
-  /* =========================================
-     MESSAGES
-  ========================================= */
 
   getMessages(eventID) {
 
     return this.sql.exec(`
-      SELECT *
+      SELECT
+        id,
+        username,
+        message,
+        event_id,
+        is_owner,
+        is_mod,
+        reply_to_username,
+        reply_to_msg,
+        reply_to_id,
+        created_at
       FROM messages
       WHERE event_id = ?
-      ORDER BY created_at ASC
+      ORDER BY id DESC
       LIMIT 100
-    `, eventID).toArray();
+    `, eventID)
+      .toArray()
+      .reverse();
   }
 
+  viewerCount() {
+    return this.ctx.getWebSockets().length;
+  }
 
-  /* =========================================
-     BROADCAST
-  ========================================= */
+  send(ws, data) {
 
-  broadcast(payload, exclude = null) {
+    try {
+      ws.send(JSON.stringify(data));
+    } catch (error) {
+      console.error("WebSocket send error:", error);
+    }
+  }
 
-    const message =
-      JSON.stringify(payload);
+  broadcast(data, except = null) {
 
-    for (const socket of this.ctx.getWebSockets()) {
+    const payload = JSON.stringify(data);
 
-      if (socket === exclude) {
-        continue;
-      }
+    for (const ws of this.ctx.getWebSockets()) {
+
+      if (ws === except) continue;
 
       try {
-        socket.send(message);
+        ws.send(payload);
       } catch (error) {
-        console.error(
-          "Broadcast error:",
-          error
-        );
+        console.error("Broadcast error:", error);
       }
     }
   }
 
+  async getProfile(username) {
 
-  broadcastPresence() {
-
-    this.broadcast({
-      type: "presence",
-      count: this.ctx.getWebSockets().length
-    });
-  }
-
-
-  broadcastSettings(eventID) {
-
-    this.broadcast({
-      type: "room_settings",
-      settings: this.getRoomSettings(eventID)
-    });
-  }
-
-
-  /* =========================================
-     USER PROFILE / PERMISSIONS
-  ========================================= */
-
-  async getUserProfile(username) {
-
-    if (!username) {
-      return null;
-    }
+    if (!username) return null;
 
     try {
 
@@ -276,29 +202,18 @@ export class FutbolXChatRoom extends DurableObject {
       const registry =
         this.env.USER_REGISTRY.get(id);
 
-      const profileURL =
-        new URL(
-          "https://futbolx-user-registry/api/users/profile"
-        );
-
-      profileURL.searchParams.set(
-        "username",
-        username
-      );
-
       const response =
         await registry.fetch(
-          new Request(profileURL, {
-            method: "GET"
-          })
+          new Request(
+            `https://futbolx-user-registry/api/users/profile?username=${encodeURIComponent(username)}`
+          )
         );
 
       if (!response.ok) {
         return null;
       }
 
-      const data =
-        await response.json();
+      const data = await response.json();
 
       return data.profile || null;
 
@@ -313,29 +228,30 @@ export class FutbolXChatRoom extends DurableObject {
     }
   }
 
-
   async authenticateSocket(ws, data) {
 
     const username =
       String(data.username || "").trim();
 
     if (!username) {
-      ws.send(JSON.stringify({
+
+      this.send(ws, {
         type: "error",
-        error: "Username required"
-      }));
+        error: "Username required."
+      });
 
       return null;
     }
 
     const profile =
-      await this.getUserProfile(username);
+      await this.getProfile(username);
 
     if (!profile) {
-      ws.send(JSON.stringify({
+
+      this.send(ws, {
         type: "error",
-        error: "Profile not found. Please register again."
-      }));
+        error: "Profile not found."
+      });
 
       return null;
     }
@@ -343,160 +259,223 @@ export class FutbolXChatRoom extends DurableObject {
     const attachment =
       ws.deserializeAttachment() || {};
 
-    attachment.username =
-      profile.username;
+    const updated = {
+      ...attachment,
+      username: profile.username,
+      authenticated: true
+    };
 
-    ws.serializeAttachment(attachment);
+    ws.serializeAttachment(updated);
+
+    this.send(ws, {
+      type: "authenticated",
+      profile
+    });
+
+    this.send(ws, {
+      type: "presence",
+      viewers: this.viewerCount()
+    });
+
+    this.broadcast({
+      type: "presence",
+      viewers: this.viewerCount()
+    });
 
     return profile;
   }
-
-
-  /* =========================================
-     WEBSOCKET MESSAGE ROUTER
-  ========================================= */
 
   async webSocketMessage(ws, message) {
 
     try {
 
-      const data =
-        typeof message === "string"
-          ? JSON.parse(message)
-          : message;
+      let data;
+
+      if (typeof message === "string") {
+
+        data = JSON.parse(message);
+
+      } else if (message instanceof ArrayBuffer) {
+
+        const text =
+          new TextDecoder().decode(message);
+
+        data = JSON.parse(text);
+
+      } else {
+
+        this.send(ws, {
+          type: "error",
+          error: "Invalid WebSocket message."
+        });
+
+        return;
+      }
 
       if (!data || typeof data !== "object") {
+        return;
+      }
+
+      /*
+       * Authentication
+       */
+      if (data.type === "authenticate") {
+
+        await this.authenticateSocket(ws, data);
         return;
       }
 
       const attachment =
         ws.deserializeAttachment() || {};
 
-      const eventID =
-        attachment.eventID || "lobby";
+      if (!attachment.authenticated) {
 
-      switch (data.type) {
+        this.send(ws, {
+          type: "error",
+          error: "Please authenticate first."
+        });
 
-        case "authenticate":
-          await this.authenticateSocket(
-            ws,
-            data
-          );
-          break;
+        return;
+      }
 
+      const username =
+        attachment.username;
 
-        case "presence_ping":
+      const profile =
+        await this.getProfile(username);
 
-          ws.send(JSON.stringify({
-            type: "presence",
-            count:
-              this.ctx.getWebSockets().length
-          }));
+      if (!profile) {
 
-          break;
+        this.send(ws, {
+          type: "error",
+          error: "Profile no longer exists."
+        });
 
+        return;
+      }
 
-        case "send_message":
+      /*
+       * Send message
+       */
+      if (data.type === "send_message") {
 
-          await this.handleSendMessage(
-            ws,
-            eventID,
-            data
-          );
+        await this.handleSendMessage(
+          ws,
+          profile,
+          data
+        );
 
-          break;
+        return;
+      }
 
+      /*
+       * Delete message
+       */
+      if (data.type === "delete_message") {
 
-        case "delete_message":
+        await this.handleDeleteMessage(
+          ws,
+          profile,
+          data
+        );
 
-          await this.handleDeleteMessage(
-            ws,
-            eventID,
-            data
-          );
+        return;
+      }
 
-          break;
+      /*
+       * Pin message
+       */
+      if (data.type === "pin_message") {
 
+        await this.handlePinMessage(
+          ws,
+          profile,
+          data
+        );
 
-        case "pin_message":
+        return;
+      }
 
-          await this.handlePinMessage(
-            ws,
-            eventID,
-            data
-          );
+      /*
+       * Unpin message
+       */
+      if (data.type === "unpin_message") {
 
-          break;
+        await this.handleUnpinMessage(
+          ws,
+          profile
+        );
 
+        return;
+      }
 
-        case "unpin_message":
+      /*
+       * Announcement
+       */
+      if (data.type === "set_announcement") {
 
-          await this.handleUnpinMessage(
-            ws,
-            eventID
-          );
+        await this.handleAnnouncement(
+          ws,
+          profile,
+          data
+        );
 
-          break;
+        return;
+      }
 
+      /*
+       * Slow mode
+       */
+      if (data.type === "set_slow_mode") {
 
-        case "publish_announcement":
+        await this.handleSlowMode(
+          ws,
+          profile,
+          data
+        );
 
-          await this.handleAnnouncement(
-            ws,
-            eventID,
-            data
-          );
+        return;
+      }
 
-          break;
+      /*
+       * Chat lock
+       */
+      if (data.type === "toggle_chat_lock") {
 
+        await this.handleChatLock(
+          ws,
+          profile,
+          data
+        );
 
-        case "dismiss_announcement":
+        return;
+      }
 
-          await this.handleDismissAnnouncement(
-            ws,
-            eventID
-          );
+      /*
+       * Clear room
+       */
+      if (data.type === "clear_room") {
 
-          break;
+        await this.handleClearRoom(
+          ws,
+          profile
+        );
 
+        return;
+      }
 
-        case "save_slow_mode":
+      /*
+       * Typing
+       */
+      if (data.type === "typing") {
 
-          await this.handleSlowMode(
-            ws,
-            eventID,
-            data
-          );
+        this.broadcast({
+          type: "typing",
+          username: profile.username,
+          is_typing: data.is_typing === true
+        }, ws);
 
-          break;
-
-
-        case "toggle_chat_closed":
-
-          await this.handleToggleChat(
-            ws,
-            eventID
-          );
-
-          break;
-
-
-        case "clear_chat":
-
-          await this.handleClearChat(
-            ws,
-            eventID
-          );
-
-          break;
-
-
-        default:
-
-          ws.send(JSON.stringify({
-            type: "error",
-            error: "Unknown message type"
-          }));
+        return;
       }
 
     } catch (error) {
@@ -506,159 +485,98 @@ export class FutbolXChatRoom extends DurableObject {
         error
       );
 
-      try {
-
-        ws.send(JSON.stringify({
-          type: "error",
-          error: "Invalid request"
-        }));
-
-      } catch {}
+      this.send(ws, {
+        type: "error",
+        error: "Server error while processing your request."
+      });
     }
   }
 
+  async handleSendMessage(ws, profile, data) {
 
-  /* =========================================
-     SEND MESSAGE
-  ========================================= */
+    const settings =
+      this.getSettings(
+        data.event_id ||
+        this.getEventID(ws)
+      );
 
-  async handleSendMessage(ws, eventID, data) {
+    if (settings?.is_closed) {
 
-    const attachment =
-      ws.deserializeAttachment() || {};
-
-    const username =
-      attachment.username;
-
-    if (!username) {
-
-      ws.send(JSON.stringify({
+      this.send(ws, {
         type: "error",
-        error: "Please authenticate first"
-      }));
-
-      return;
-    }
-
-    const profile =
-      await this.getUserProfile(username);
-
-    if (!profile) {
-
-      ws.send(JSON.stringify({
-        type: "error",
-        error: "Profile not found"
-      }));
-
-      return;
-    }
-
-    const text =
-      String(data.message || "").trim();
-
-    if (!text) {
-      return;
-    }
-
-    if (text.length > 250) {
-
-      ws.send(JSON.stringify({
-        type: "error",
-        error: "Message too long"
-      }));
+        error: "Chat is currently closed."
+      });
 
       return;
     }
 
     if (profile.is_muted) {
 
-      ws.send(JSON.stringify({
+      this.send(ws, {
         type: "error",
         error: "You are muted."
-      }));
+      });
 
       return;
     }
 
-    const settings =
-      this.getRoomSettings(eventID);
+    const message =
+      String(data.message || "").trim();
 
-    const isOwner =
-      !!profile.is_owner;
+    if (!message) return;
 
-    const isMod =
-      !!profile.is_mod;
+    if (message.length > 500) {
 
-
-    if (
-      settings.is_closed &&
-      !isOwner &&
-      !isMod
-    ) {
-
-      ws.send(JSON.stringify({
+      this.send(ws, {
         type: "error",
-        error: "Chat is currently closed"
-      }));
+        error: "Message is too long."
+      });
 
       return;
     }
 
+    const now = Date.now();
 
-    /* Server-side slow mode */
+    const attachment =
+      ws.deserializeAttachment() || {};
 
+    /*
+     * Server-side slow mode check
+     */
     if (
-      settings.slow_mode > 0 &&
-      !isOwner &&
-      !isMod
+      settings?.slow_mode &&
+      attachment.lastMessageAt &&
+      now - attachment.lastMessageAt < 5000
     ) {
 
-      const last =
-        this.lastMessageTimes.get(
-          username.toLowerCase()
-        ) || 0;
+      this.send(ws, {
+        type: "error",
+        error: "Slow mode is enabled. Please wait."
+      });
 
-      const now =
-        Date.now();
-
-      const elapsed =
-        Math.floor(
-          (now - last) / 1000
-        );
-
-      if (
-        elapsed < settings.slow_mode
-      ) {
-
-        const remaining =
-          settings.slow_mode - elapsed;
-
-        ws.send(JSON.stringify({
-          type: "error",
-          error:
-            `Slow mode: wait ${remaining} seconds.`
-        }));
-
-        return;
-      }
-
-      this.lastMessageTimes.set(
-        username.toLowerCase(),
-        now
-      );
+      return;
     }
 
+    const eventID =
+      settings.event_id;
 
-    const id =
-      crypto.randomUUID();
+    const replyToUsername =
+      data.reply_to_username
+        ? String(data.reply_to_username)
+        : null;
 
-    const createdAt =
-      new Date().toISOString();
+    const replyToMsg =
+      data.reply_to_msg
+        ? String(data.reply_to_msg)
+        : null;
 
+    const replyToID =
+      data.reply_to_id
+        ? Number(data.reply_to_id)
+        : null;
 
     this.sql.exec(`
       INSERT INTO messages (
-        id,
         username,
         message,
         event_id,
@@ -666,488 +584,301 @@ export class FutbolXChatRoom extends DurableObject {
         is_mod,
         reply_to_username,
         reply_to_msg,
-        reply_to_id,
-        created_at
+        reply_to_id
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `,
-      id,
       profile.username,
-      text,
+      message,
       eventID,
-      isOwner ? 1 : 0,
-      isMod ? 1 : 0,
-      data.reply_to_username || null,
-      data.reply_to_msg || null,
-      data.reply_to_id || null,
-      createdAt
+      profile.is_owner ? 1 : 0,
+      profile.is_mod ? 1 : 0,
+      replyToUsername,
+      replyToMsg,
+      replyToID
     );
 
+    const saved =
+      this.sql.exec(`
+        SELECT
+          id,
+          username,
+          message,
+          event_id,
+          is_owner,
+          is_mod,
+          reply_to_username,
+          reply_to_msg,
+          reply_to_id,
+          created_at
+        FROM messages
+        WHERE id = last_insert_rowid()
+        LIMIT 1
+      `).toArray()[0];
 
-    const chatMessage = {
-      id,
-      username: profile.username,
-      message: text,
-      event_id: eventID,
-      is_owner: isOwner,
-      is_mod: isMod,
-      reply_to_username:
-        data.reply_to_username || null,
-      reply_to_msg:
-        data.reply_to_msg || null,
-      reply_to_id:
-        data.reply_to_id || null,
-      created_at: createdAt
-    };
-
+    ws.serializeAttachment({
+      ...attachment,
+      lastMessageAt: now
+    });
 
     this.broadcast({
       type: "message_new",
-      message: chatMessage
+      message: saved
     });
   }
 
+  async handleDeleteMessage(ws, profile, data) {
 
-  /* =========================================
-     DELETE MESSAGE
-  ========================================= */
+    if (!profile.is_owner && !profile.is_mod) {
 
-  async handleDeleteMessage(
-    ws,
-    eventID,
-    data
-  ) {
+      this.send(ws, {
+        type: "error",
+        error: "Permission denied."
+      });
 
-    const attachment =
-      ws.deserializeAttachment() || {};
-
-    const username =
-      attachment.username;
-
-    if (!username) {
-      return;
-    }
-
-    const profile =
-      await this.getUserProfile(username);
-
-    if (!profile) {
       return;
     }
 
     const id =
-      String(data.id || "").trim();
+      Number(data.id);
 
-    if (!id) {
-      return;
-    }
-
-    const rows =
-      this.sql.exec(`
-        SELECT *
-        FROM messages
-        WHERE id = ?
-          AND event_id = ?
-        LIMIT 1
-      `,
-        id,
-        eventID
-      ).toArray();
-
-    if (!rows.length) {
-      return;
-    }
-
-    const message =
-      rows[0];
-
-    const isOwner =
-      !!profile.is_owner;
-
-    const isMod =
-      !!profile.is_mod;
-
-    const isAuthor =
-      message.username.toLowerCase() ===
-      profile.username.toLowerCase();
-
-
-    if (
-      !isOwner &&
-      !isMod &&
-      !isAuthor
-    ) {
-
-      ws.send(JSON.stringify({
-        type: "error",
-        error: "Not authorized"
-      }));
-
-      return;
-    }
-
+    if (!id) return;
 
     this.sql.exec(`
       DELETE FROM messages
       WHERE id = ?
-        AND event_id = ?
-    `,
-      id,
-      eventID
-    );
-
+    `, id);
 
     this.broadcast({
-      type: "message_delete",
+      type: "message_deleted",
       id
     });
-
-
-    /* If deleted message was pinned */
-
-    const settings =
-      this.getRoomSettings(eventID);
-
-    if (
-      settings.pinned_message_id === id
-    ) {
-
-      this.saveRoomSettings(
-        eventID,
-        {
-          pinned_message_id: null
-        }
-      );
-
-      this.broadcastSettings(eventID);
-    }
   }
 
+  async handlePinMessage(ws, profile, data) {
 
-  /* =========================================
-     PIN MESSAGE
-  ========================================= */
+    if (!profile.is_owner && !profile.is_mod) {
 
-  async handlePinMessage(
-    ws,
-    eventID,
-    data
-  ) {
-
-    const profile =
-      await this.authenticateSocket(
-        ws,
-        data
-      );
-
-    if (!profile) {
-      return;
-    }
-
-    if (
-      !profile.is_owner &&
-      !profile.is_mod
-    ) {
-
-      ws.send(JSON.stringify({
+      this.send(ws, {
         type: "error",
-        error: "Not authorized"
-      }));
+        error: "Permission denied."
+      });
 
       return;
     }
 
     const id =
-      String(data.id || "").trim();
+      Number(data.id);
 
-    if (!id) {
-      return;
-    }
+    if (!id) return;
 
-    const rows =
-      this.sql.exec(`
-        SELECT id
-        FROM messages
-        WHERE id = ?
-          AND event_id = ?
-        LIMIT 1
-      `,
-        id,
-        eventID
-      ).toArray();
-
-    if (!rows.length) {
-      return;
-    }
-
-    this.saveRoomSettings(
-      eventID,
-      {
-        pinned_message_id: id
-      }
-    );
-
-    this.broadcastSettings(eventID);
-  }
-
-
-  /* =========================================
-     UNPIN MESSAGE
-  ========================================= */
-
-  async handleUnpinMessage(
-    ws,
-    eventID
-  ) {
-
-    const attachment =
-      ws.deserializeAttachment() || {};
-
-    const profile =
-      await this.getUserProfile(
-        attachment.username
-      );
-
-    if (!profile) {
-      return;
-    }
-
-    if (
-      !profile.is_owner &&
-      !profile.is_mod
-    ) {
-      return;
-    }
-
-    this.saveRoomSettings(
-      eventID,
-      {
-        pinned_message_id: null
-      }
-    );
-
-    this.broadcastSettings(eventID);
-  }
-
-
-  /* =========================================
-     ANNOUNCEMENT
-  ========================================= */
-
-  async handleAnnouncement(
-    ws,
-    eventID,
-    data
-  ) {
-
-    const attachment =
-      ws.deserializeAttachment() || {};
-
-    const profile =
-      await this.getUserProfile(
-        attachment.username
-      );
-
-    if (!profile || !profile.is_owner) {
-      return;
-    }
-
-    const text =
-      String(data.text || "").trim();
-
-    if (text.length > 500) {
-      return;
-    }
-
-    this.saveRoomSettings(
-      eventID,
-      {
-        announcement:
-          text || null
-      }
-    );
-
-    this.broadcastSettings(eventID);
-  }
-
-
-  /* =========================================
-     DISMISS ANNOUNCEMENT
-  ========================================= */
-
-  async handleDismissAnnouncement(
-    ws,
-    eventID
-  ) {
-
-    const attachment =
-      ws.deserializeAttachment() || {};
-
-    const profile =
-      await this.getUserProfile(
-        attachment.username
-      );
-
-    if (!profile || !profile.is_owner) {
-      return;
-    }
-
-    this.saveRoomSettings(
-      eventID,
-      {
-        announcement: null
-      }
-    );
-
-    this.broadcastSettings(eventID);
-  }
-
-
-  /* =========================================
-     SLOW MODE
-  ========================================= */
-
-  async handleSlowMode(
-    ws,
-    eventID,
-    data
-  ) {
-
-    const attachment =
-      ws.deserializeAttachment() || {};
-
-    const profile =
-      await this.getUserProfile(
-        attachment.username
-      );
-
-    if (
-      !profile ||
-      (!profile.is_owner && !profile.is_mod)
-    ) {
-      return;
-    }
-
-    const seconds =
-      Math.max(
-        0,
-        Math.min(
-          300,
-          parseInt(data.seconds, 10) || 0
-        )
-      );
-
-    this.saveRoomSettings(
-      eventID,
-      {
-        slow_mode: seconds
-      }
-    );
-
-    this.broadcastSettings(eventID);
-  }
-
-
-  /* =========================================
-     LOCK / UNLOCK CHAT
-  ========================================= */
-
-  async handleToggleChat(
-    ws,
-    eventID
-  ) {
-
-    const attachment =
-      ws.deserializeAttachment() || {};
-
-    const profile =
-      await this.getUserProfile(
-        attachment.username
-      );
-
-    if (
-      !profile ||
-      (!profile.is_owner && !profile.is_mod)
-    ) {
-      return;
-    }
-
-    const current =
-      this.getRoomSettings(eventID);
-
-    this.saveRoomSettings(
-      eventID,
-      {
-        is_closed:
-          !current.is_closed
-      }
-    );
-
-    this.broadcastSettings(eventID);
-  }
-
-
-  /* =========================================
-     CLEAR CHAT
-  ========================================= */
-
-  async handleClearChat(
-    ws,
-    eventID
-  ) {
-
-    const attachment =
-      ws.deserializeAttachment() || {};
-
-    const profile =
-      await this.getUserProfile(
-        attachment.username
-      );
-
-    if (
-      !profile ||
-      (!profile.is_owner && !profile.is_mod)
-    ) {
-      return;
-    }
+    const eventID =
+      this.getEventID(ws);
 
     this.sql.exec(`
-      DELETE FROM messages
+      UPDATE room_settings
+      SET pinned_message_id = ?
+      WHERE event_id = ?
+    `, id, eventID);
+
+    this.broadcast({
+      type: "pinned",
+      id
+    });
+  }
+
+  async handleUnpinMessage(ws, profile) {
+
+    if (!profile.is_owner && !profile.is_mod) {
+
+      this.send(ws, {
+        type: "error",
+        error: "Permission denied."
+      });
+
+      return;
+    }
+
+    const eventID =
+      this.getEventID(ws);
+
+    this.sql.exec(`
+      UPDATE room_settings
+      SET pinned_message_id = NULL
+      WHERE event_id = ?
+    `, eventID);
+
+    this.broadcast({
+      type: "unpinned"
+    });
+  }
+
+  async handleAnnouncement(ws, profile, data) {
+
+    if (!profile.is_owner && !profile.is_mod) {
+
+      this.send(ws, {
+        type: "error",
+        error: "Permission denied."
+      });
+
+      return;
+    }
+
+    const announcement =
+      String(data.announcement || "").trim();
+
+    const eventID =
+      this.getEventID(ws);
+
+    this.sql.exec(`
+      UPDATE room_settings
+      SET announcement = ?
       WHERE event_id = ?
     `,
+      announcement || null,
       eventID
     );
 
     this.broadcast({
-      type: "chat_cleared"
+      type: "announcement",
+      announcement: announcement || null
     });
+  }
 
-    const settings =
-      this.getRoomSettings(eventID);
+  async handleSlowMode(ws, profile, data) {
 
-    if (settings.pinned_message_id) {
+    if (!profile.is_owner && !profile.is_mod) {
 
-      this.saveRoomSettings(
-        eventID,
-        {
-          pinned_message_id: null
-        }
-      );
+      this.send(ws, {
+        type: "error",
+        error: "Permission denied."
+      });
 
-      this.broadcastSettings(eventID);
+      return;
     }
+
+    const enabled =
+      data.enabled === true;
+
+    const eventID =
+      this.getEventID(ws);
+
+    this.sql.exec(`
+      UPDATE room_settings
+      SET slow_mode = ?
+      WHERE event_id = ?
+    `,
+      enabled ? 1 : 0,
+      eventID
+    );
+
+    this.broadcast({
+      type: "slow_mode",
+      enabled
+    });
   }
 
+  async handleChatLock(ws, profile, data) {
 
-  /* =========================================
-     SOCKET CLOSE / ERROR
-  ========================================= */
+    if (!profile.is_owner && !profile.is_mod) {
 
-  async webSocketClose() {
-    this.broadcastPresence();
+      this.send(ws, {
+        type: "error",
+        error: "Permission denied."
+      });
+
+      return;
+    }
+
+    const closed =
+      data.closed === true;
+
+    const eventID =
+      this.getEventID(ws);
+
+    this.sql.exec(`
+      UPDATE room_settings
+      SET is_closed = ?
+      WHERE event_id = ?
+    `,
+      closed ? 1 : 0,
+      eventID
+    );
+
+    this.broadcast({
+      type: "chat_lock",
+      closed
+    });
   }
 
-  async webSocketError() {
-    this.broadcastPresence();
+  async handleClearRoom(ws, profile) {
+
+    if (!profile.is_owner && !profile.is_mod) {
+
+      this.send(ws, {
+        type: "error",
+        error: "Permission denied."
+      });
+
+      return;
+    }
+
+    const eventID =
+      this.getEventID(ws);
+
+    this.sql.exec(`
+      DELETE FROM messages
+      WHERE event_id = ?
+    `, eventID);
+
+    this.sql.exec(`
+      UPDATE room_settings
+      SET pinned_message_id = NULL
+      WHERE event_id = ?
+    `, eventID);
+
+    this.broadcast({
+      type: "room_cleared"
+    });
   }
-                  }
+
+  getEventID(ws) {
+
+    const attachment =
+      ws.deserializeAttachment() || {};
+
+    return attachment.eventID || "unknown";
+  }
+
+  webSocketClose(
+    ws,
+    code,
+    reason,
+    wasClean
+  ) {
+
+    console.log(
+      "Chat WebSocket closed:",
+      code,
+      reason,
+      wasClean
+    );
+
+    /*
+     * Notify remaining users about updated viewer count.
+     */
+    this.broadcast({
+      type: "presence",
+      viewers: this.viewerCount()
+    });
+  }
+
+  webSocketError(ws, error) {
+
+    console.error(
+      "Chat WebSocket error:",
+      error
+    );
+  }
+        }
