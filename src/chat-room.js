@@ -9,6 +9,20 @@ export class FutbolXChatRoom extends DurableObject {
     this.env = env;
     this.sql = ctx.storage.sql;
 
+    /*
+     * Restore hibernating WebSocket connections.
+     */
+    this.ctx.getWebSockets().forEach((ws) => {
+      try {
+        ws.deserializeAttachment();
+      } catch (error) {
+        console.error("WebSocket attachment restore error:", error);
+      }
+    });
+
+    /*
+     * Database tables
+     */
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS room_settings (
         event_id TEXT PRIMARY KEY,
@@ -40,21 +54,46 @@ export class FutbolXChatRoom extends DurableObject {
     `);
   }
 
+  /*
+   * ============================================================
+   * WEBSOCKET CONNECTION
+   * ============================================================
+   */
+
   async fetch(request) {
 
     const url = new URL(request.url);
-    const eventID =
-      url.searchParams.get("event")?.trim() || "unknown";
 
-    if (
-      request.method !== "GET" ||
-      request.headers.get("Upgrade")?.toLowerCase() !== "websocket"
-    ) {
-      return new Response("WebSocket upgrade required", {
-        status: 426
-      });
+    const eventID =
+      url.searchParams.get("event")?.trim();
+
+    if (!eventID) {
+      return new Response(
+        "Missing event ID",
+        { status: 400 }
+      );
     }
 
+    if (request.method !== "GET") {
+      return new Response(
+        "GET required",
+        { status: 405 }
+      );
+    }
+
+    const upgrade =
+      request.headers.get("Upgrade");
+
+    if (!upgrade || upgrade.toLowerCase() !== "websocket") {
+      return new Response(
+        "WebSocket upgrade required",
+        { status: 426 }
+      );
+    }
+
+    /*
+     * Create WebSocket pair.
+     */
     const pair = new WebSocketPair();
 
     const client = pair[0];
@@ -62,11 +101,17 @@ export class FutbolXChatRoom extends DurableObject {
 
     /*
      * IMPORTANT:
-     * Accept the WebSocket BEFORE serializeAttachment().
-     * This is required for the Hibernation WebSocket API.
+     *
+     * Accept the server socket using the Durable Object
+     * Hibernation WebSocket API.
      */
     this.ctx.acceptWebSocket(server);
 
+    /*
+     * Store connection state.
+     *
+     * This survives Durable Object hibernation.
+     */
     server.serializeAttachment({
       eventID,
       username: null,
@@ -74,40 +119,88 @@ export class FutbolXChatRoom extends DurableObject {
       lastMessageAt: 0
     });
 
-    this.ensureRoom(eventID);
-
-    try {
-      this.send(server, {
-        type: "room_init",
-        event_id: eventID,
-        settings: this.getSettings(eventID),
-        messages: this.getMessages(eventID),
-        viewers: this.viewerCount()
-      });
-    } catch (error) {
-      console.error("Initial room setup error:", error);
-
-      try {
-        server.close(1011, "Room initialization failed");
-      } catch {}
-    }
-
-    return new Response(null, {
+    /*
+     * Return the WebSocket upgrade IMMEDIATELY.
+     *
+     * Do not perform database queries before returning 101.
+     */
+    const response = new Response(null, {
       status: 101,
       webSocket: client
     });
+
+    /*
+     * Initialize the room after the upgrade has been accepted.
+     */
+    this.initializeSocket(server, eventID).catch((error) => {
+
+      console.error(
+        "Socket initialization error:",
+        error
+      );
+
+      try {
+        server.close(
+          1011,
+          "Room initialization failed"
+        );
+      } catch {}
+    });
+
+    return response;
   }
+
+  async initializeSocket(ws, eventID) {
+
+    /*
+     * Make sure room exists.
+     */
+    this.ensureRoom(eventID);
+
+    /*
+     * Send initial room data.
+     */
+    const settings =
+      this.getSettings(eventID);
+
+    const messages =
+      this.getMessages(eventID);
+
+    this.send(ws, {
+      type: "room_init",
+      event_id: eventID,
+      settings,
+      messages,
+      viewers: this.viewerCount()
+    });
+
+    /*
+     * Send current presence.
+     */
+    this.broadcast({
+      type: "presence",
+      viewers: this.viewerCount()
+    });
+  }
+
+  /*
+   * ============================================================
+   * ROOM DATABASE
+   * ============================================================
+   */
 
   ensureRoom(eventID) {
 
-    const existing = this.sql.exec(`
-      SELECT event_id
-      FROM room_settings
-      WHERE event_id = ?
-      LIMIT 1
-    `, eventID).toArray();
+    const existing =
+      this.sql.exec(`
+        SELECT event_id
+        FROM room_settings
+        WHERE event_id = ?
+        LIMIT 1
+      `, eventID).toArray();
 
     if (!existing.length) {
+
       this.sql.exec(`
         INSERT INTO room_settings (
           event_id,
@@ -161,43 +254,91 @@ export class FutbolXChatRoom extends DurableObject {
       .reverse();
   }
 
+  /*
+   * ============================================================
+   * WEBSOCKET HELPERS
+   * ============================================================
+   */
+
   viewerCount() {
-    return this.ctx.getWebSockets().length;
+
+    return this.ctx
+      .getWebSockets()
+      .length;
   }
 
   send(ws, data) {
 
     try {
-      ws.send(JSON.stringify(data));
+
+      if (
+        !ws ||
+        ws.readyState !== WebSocket.OPEN
+      ) {
+        return;
+      }
+
+      ws.send(
+        JSON.stringify(data)
+      );
+
     } catch (error) {
-      console.error("WebSocket send error:", error);
+
+      console.error(
+        "WebSocket send error:",
+        error
+      );
     }
   }
 
   broadcast(data, except = null) {
 
-    const payload = JSON.stringify(data);
+    const payload =
+      JSON.stringify(data);
 
-    for (const ws of this.ctx.getWebSockets()) {
+    for (
+      const ws of this.ctx.getWebSockets()
+    ) {
 
-      if (ws === except) continue;
+      if (ws === except) {
+        continue;
+      }
 
       try {
-        ws.send(payload);
+
+        if (
+          ws.readyState === WebSocket.OPEN
+        ) {
+          ws.send(payload);
+        }
+
       } catch (error) {
-        console.error("Broadcast error:", error);
+
+        console.error(
+          "Broadcast error:",
+          error
+        );
       }
     }
   }
 
+  /*
+   * ============================================================
+   * PROFILE
+   * ============================================================
+   */
+
   async getProfile(username) {
 
-    if (!username) return null;
+    if (!username) {
+      return null;
+    }
 
     try {
 
       const id =
-        this.env.USER_REGISTRY.idFromName("global");
+        this.env.USER_REGISTRY
+          .idFromName("global");
 
       const registry =
         this.env.USER_REGISTRY.get(id);
@@ -205,7 +346,9 @@ export class FutbolXChatRoom extends DurableObject {
       const response =
         await registry.fetch(
           new Request(
-            `https://futbolx-user-registry/api/users/profile?username=${encodeURIComponent(username)}`
+            "https://futbolx-user-registry" +
+            "/api/users/profile?username=" +
+            encodeURIComponent(username)
           )
         );
 
@@ -213,7 +356,8 @@ export class FutbolXChatRoom extends DurableObject {
         return null;
       }
 
-      const data = await response.json();
+      const data =
+        await response.json();
 
       return data.profile || null;
 
@@ -228,10 +372,18 @@ export class FutbolXChatRoom extends DurableObject {
     }
   }
 
+  /*
+   * ============================================================
+   * AUTHENTICATION
+   * ============================================================
+   */
+
   async authenticateSocket(ws, data) {
 
     const username =
-      String(data.username || "").trim();
+      String(
+        data.username || ""
+      ).trim();
 
     if (!username) {
 
@@ -272,11 +424,6 @@ export class FutbolXChatRoom extends DurableObject {
       profile
     });
 
-    this.send(ws, {
-      type: "presence",
-      viewers: this.viewerCount()
-    });
-
     this.broadcast({
       type: "presence",
       viewers: this.viewerCount()
@@ -284,6 +431,12 @@ export class FutbolXChatRoom extends DurableObject {
 
     return profile;
   }
+
+  /*
+   * ============================================================
+   * WEBSOCKET MESSAGE HANDLER
+   * ============================================================
+   */
 
   async webSocketMessage(ws, message) {
 
@@ -295,10 +448,13 @@ export class FutbolXChatRoom extends DurableObject {
 
         data = JSON.parse(message);
 
-      } else if (message instanceof ArrayBuffer) {
+      } else if (
+        message instanceof ArrayBuffer
+      ) {
 
         const text =
-          new TextDecoder().decode(message);
+          new TextDecoder()
+            .decode(message);
 
         data = JSON.parse(text);
 
@@ -312,19 +468,31 @@ export class FutbolXChatRoom extends DurableObject {
         return;
       }
 
-      if (!data || typeof data !== "object") {
+      if (
+        !data ||
+        typeof data !== "object"
+      ) {
         return;
       }
 
       /*
-       * Authentication
+       * AUTHENTICATE
        */
-      if (data.type === "authenticate") {
+      if (
+        data.type === "authenticate"
+      ) {
 
-        await this.authenticateSocket(ws, data);
+        await this.authenticateSocket(
+          ws,
+          data
+        );
+
         return;
       }
 
+      /*
+       * Get connection state.
+       */
       const attachment =
         ws.deserializeAttachment() || {};
 
@@ -355,9 +523,11 @@ export class FutbolXChatRoom extends DurableObject {
       }
 
       /*
-       * Send message
+       * SEND MESSAGE
        */
-      if (data.type === "send_message") {
+      if (
+        data.type === "send_message"
+      ) {
 
         await this.handleSendMessage(
           ws,
@@ -369,9 +539,11 @@ export class FutbolXChatRoom extends DurableObject {
       }
 
       /*
-       * Delete message
+       * DELETE MESSAGE
        */
-      if (data.type === "delete_message") {
+      if (
+        data.type === "delete_message"
+      ) {
 
         await this.handleDeleteMessage(
           ws,
@@ -383,9 +555,11 @@ export class FutbolXChatRoom extends DurableObject {
       }
 
       /*
-       * Pin message
+       * PIN
        */
-      if (data.type === "pin_message") {
+      if (
+        data.type === "pin_message"
+      ) {
 
         await this.handlePinMessage(
           ws,
@@ -397,9 +571,11 @@ export class FutbolXChatRoom extends DurableObject {
       }
 
       /*
-       * Unpin message
+       * UNPIN
        */
-      if (data.type === "unpin_message") {
+      if (
+        data.type === "unpin_message"
+      ) {
 
         await this.handleUnpinMessage(
           ws,
@@ -410,9 +586,11 @@ export class FutbolXChatRoom extends DurableObject {
       }
 
       /*
-       * Announcement
+       * ANNOUNCEMENT
        */
-      if (data.type === "set_announcement") {
+      if (
+        data.type === "set_announcement"
+      ) {
 
         await this.handleAnnouncement(
           ws,
@@ -424,9 +602,11 @@ export class FutbolXChatRoom extends DurableObject {
       }
 
       /*
-       * Slow mode
+       * SLOW MODE
        */
-      if (data.type === "set_slow_mode") {
+      if (
+        data.type === "set_slow_mode"
+      ) {
 
         await this.handleSlowMode(
           ws,
@@ -438,9 +618,11 @@ export class FutbolXChatRoom extends DurableObject {
       }
 
       /*
-       * Chat lock
+       * CHAT LOCK
        */
-      if (data.type === "toggle_chat_lock") {
+      if (
+        data.type === "toggle_chat_lock"
+      ) {
 
         await this.handleChatLock(
           ws,
@@ -452,9 +634,11 @@ export class FutbolXChatRoom extends DurableObject {
       }
 
       /*
-       * Clear room
+       * CLEAR ROOM
        */
-      if (data.type === "clear_room") {
+      if (
+        data.type === "clear_room"
+      ) {
 
         await this.handleClearRoom(
           ws,
@@ -465,14 +649,17 @@ export class FutbolXChatRoom extends DurableObject {
       }
 
       /*
-       * Typing
+       * TYPING
        */
-      if (data.type === "typing") {
+      if (
+        data.type === "typing"
+      ) {
 
         this.broadcast({
           type: "typing",
           username: profile.username,
-          is_typing: data.is_typing === true
+          is_typing:
+            data.is_typing === true
         }, ws);
 
         return;
@@ -487,24 +674,36 @@ export class FutbolXChatRoom extends DurableObject {
 
       this.send(ws, {
         type: "error",
-        error: "Server error while processing your request."
+        error:
+          "Server error while processing your request."
       });
     }
   }
 
-  async handleSendMessage(ws, profile, data) {
+  /*
+   * ============================================================
+   * SEND MESSAGE
+   * ============================================================
+   */
+
+  async handleSendMessage(
+    ws,
+    profile,
+    data
+  ) {
+
+    const eventID =
+      this.getEventID(ws);
 
     const settings =
-      this.getSettings(
-        data.event_id ||
-        this.getEventID(ws)
-      );
+      this.getSettings(eventID);
 
     if (settings?.is_closed) {
 
       this.send(ws, {
         type: "error",
-        error: "Chat is currently closed."
+        error:
+          "Chat is currently closed."
       });
 
       return;
@@ -514,51 +713,60 @@ export class FutbolXChatRoom extends DurableObject {
 
       this.send(ws, {
         type: "error",
-        error: "You are muted."
+        error:
+          "You are muted."
       });
 
       return;
     }
 
     const message =
-      String(data.message || "").trim();
+      String(
+        data.message || ""
+      ).trim();
 
-    if (!message) return;
+    if (!message) {
+      return;
+    }
 
     if (message.length > 500) {
 
       this.send(ws, {
         type: "error",
-        error: "Message is too long."
+        error:
+          "Message is too long."
       });
 
       return;
     }
 
-    const now = Date.now();
+    const now =
+      Date.now();
 
     const attachment =
       ws.deserializeAttachment() || {};
 
     /*
-     * Server-side slow mode check
+     * Slow mode
      */
     if (
       settings?.slow_mode &&
+      !profile.is_owner &&
+      !profile.is_mod &&
       attachment.lastMessageAt &&
-      now - attachment.lastMessageAt < 5000
+      now -
+        attachment.lastMessageAt <
+        5000
     ) {
 
       this.send(ws, {
         type: "error",
-        error: "Slow mode is enabled. Please wait."
+        error:
+          "Slow mode is enabled. Please wait."
       });
 
       return;
     }
-
-    const eventID =
-      settings.event_id;
 
     const replyToUsername =
       data.reply_to_username
@@ -614,7 +822,8 @@ export class FutbolXChatRoom extends DurableObject {
         FROM messages
         WHERE id = last_insert_rowid()
         LIMIT 1
-      `).toArray()[0];
+      `)
+      .toArray()[0];
 
     ws.serializeAttachment({
       ...attachment,
@@ -627,13 +836,27 @@ export class FutbolXChatRoom extends DurableObject {
     });
   }
 
-  async handleDeleteMessage(ws, profile, data) {
+  /*
+   * ============================================================
+   * DELETE
+   * ============================================================
+   */
 
-    if (!profile.is_owner && !profile.is_mod) {
+  async handleDeleteMessage(
+    ws,
+    profile,
+    data
+  ) {
+
+    if (
+      !profile.is_owner &&
+      !profile.is_mod
+    ) {
 
       this.send(ws, {
         type: "error",
-        error: "Permission denied."
+        error:
+          "Permission denied."
       });
 
       return;
@@ -642,7 +865,9 @@ export class FutbolXChatRoom extends DurableObject {
     const id =
       Number(data.id);
 
-    if (!id) return;
+    if (!id) {
+      return;
+    }
 
     this.sql.exec(`
       DELETE FROM messages
@@ -655,13 +880,27 @@ export class FutbolXChatRoom extends DurableObject {
     });
   }
 
-  async handlePinMessage(ws, profile, data) {
+  /*
+   * ============================================================
+   * PIN
+   * ============================================================
+   */
 
-    if (!profile.is_owner && !profile.is_mod) {
+  async handlePinMessage(
+    ws,
+    profile,
+    data
+  ) {
+
+    if (
+      !profile.is_owner &&
+      !profile.is_mod
+    ) {
 
       this.send(ws, {
         type: "error",
-        error: "Permission denied."
+        error:
+          "Permission denied."
       });
 
       return;
@@ -670,7 +909,9 @@ export class FutbolXChatRoom extends DurableObject {
     const id =
       Number(data.id);
 
-    if (!id) return;
+    if (!id) {
+      return;
+    }
 
     const eventID =
       this.getEventID(ws);
@@ -687,13 +928,26 @@ export class FutbolXChatRoom extends DurableObject {
     });
   }
 
-  async handleUnpinMessage(ws, profile) {
+  /*
+   * ============================================================
+   * UNPIN
+   * ============================================================
+   */
 
-    if (!profile.is_owner && !profile.is_mod) {
+  async handleUnpinMessage(
+    ws,
+    profile
+  ) {
+
+    if (
+      !profile.is_owner &&
+      !profile.is_mod
+    ) {
 
       this.send(ws, {
         type: "error",
-        error: "Permission denied."
+        error:
+          "Permission denied."
       });
 
       return;
@@ -713,20 +967,36 @@ export class FutbolXChatRoom extends DurableObject {
     });
   }
 
-  async handleAnnouncement(ws, profile, data) {
+  /*
+   * ============================================================
+   * ANNOUNCEMENT
+   * ============================================================
+   */
 
-    if (!profile.is_owner && !profile.is_mod) {
+  async handleAnnouncement(
+    ws,
+    profile,
+    data
+  ) {
+
+    if (
+      !profile.is_owner &&
+      !profile.is_mod
+    ) {
 
       this.send(ws, {
         type: "error",
-        error: "Permission denied."
+        error:
+          "Permission denied."
       });
 
       return;
     }
 
     const announcement =
-      String(data.announcement || "").trim();
+      String(
+        data.announcement || ""
+      ).trim();
 
     const eventID =
       this.getEventID(ws);
@@ -742,17 +1012,32 @@ export class FutbolXChatRoom extends DurableObject {
 
     this.broadcast({
       type: "announcement",
-      announcement: announcement || null
+      announcement:
+        announcement || null
     });
   }
 
-  async handleSlowMode(ws, profile, data) {
+  /*
+   * ============================================================
+   * SLOW MODE
+   * ============================================================
+   */
 
-    if (!profile.is_owner && !profile.is_mod) {
+  async handleSlowMode(
+    ws,
+    profile,
+    data
+  ) {
+
+    if (
+      !profile.is_owner &&
+      !profile.is_mod
+    ) {
 
       this.send(ws, {
         type: "error",
-        error: "Permission denied."
+        error:
+          "Permission denied."
       });
 
       return;
@@ -779,13 +1064,27 @@ export class FutbolXChatRoom extends DurableObject {
     });
   }
 
-  async handleChatLock(ws, profile, data) {
+  /*
+   * ============================================================
+   * CHAT LOCK
+   * ============================================================
+   */
 
-    if (!profile.is_owner && !profile.is_mod) {
+  async handleChatLock(
+    ws,
+    profile,
+    data
+  ) {
+
+    if (
+      !profile.is_owner &&
+      !profile.is_mod
+    ) {
 
       this.send(ws, {
         type: "error",
-        error: "Permission denied."
+        error:
+          "Permission denied."
       });
 
       return;
@@ -812,13 +1111,26 @@ export class FutbolXChatRoom extends DurableObject {
     });
   }
 
-  async handleClearRoom(ws, profile) {
+  /*
+   * ============================================================
+   * CLEAR ROOM
+   * ============================================================
+   */
 
-    if (!profile.is_owner && !profile.is_mod) {
+  async handleClearRoom(
+    ws,
+    profile
+  ) {
+
+    if (
+      !profile.is_owner &&
+      !profile.is_mod
+    ) {
 
       this.send(ws, {
         type: "error",
-        error: "Permission denied."
+        error:
+          "Permission denied."
       });
 
       return;
@@ -843,13 +1155,28 @@ export class FutbolXChatRoom extends DurableObject {
     });
   }
 
+  /*
+   * ============================================================
+   * EVENT ID
+   * ============================================================
+   */
+
   getEventID(ws) {
 
     const attachment =
       ws.deserializeAttachment() || {};
 
-    return attachment.eventID || "unknown";
+    return (
+      attachment.eventID ||
+      "unknown"
+    );
   }
+
+  /*
+   * ============================================================
+   * CLOSE
+   * ============================================================
+   */
 
   webSocketClose(
     ws,
@@ -865,20 +1192,26 @@ export class FutbolXChatRoom extends DurableObject {
       wasClean
     );
 
-    /*
-     * Notify remaining users about updated viewer count.
-     */
     this.broadcast({
       type: "presence",
       viewers: this.viewerCount()
     });
   }
 
-  webSocketError(ws, error) {
+  /*
+   * ============================================================
+   * ERROR
+   * ============================================================
+   */
+
+  webSocketError(
+    ws,
+    error
+  ) {
 
     console.error(
       "Chat WebSocket error:",
       error
     );
   }
-        }
+}
