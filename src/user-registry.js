@@ -5,6 +5,8 @@ export class FutbolXUserRegistry extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
 
+    this.ctx = ctx;
+    this.env = env;
     this.sql = ctx.storage.sql;
 
     this.sql.exec(`
@@ -30,7 +32,10 @@ export class FutbolXUserRegistry extends DurableObject {
 
     try {
 
-      /* Get one profile */
+      /* =========================================
+         GET ONE PROFILE
+      ========================================= */
+
       if (
         request.method === "GET" &&
         url.pathname === "/api/users/profile"
@@ -54,7 +59,7 @@ export class FutbolXUserRegistry extends DurableObject {
             is_muted,
             created_at
           FROM profiles
-          WHERE username = ?
+          WHERE lower(username) = lower(?)
           LIMIT 1
         `, username).toArray();
 
@@ -63,7 +68,11 @@ export class FutbolXUserRegistry extends DurableObject {
         });
       }
 
-      /* Register user */
+
+      /* =========================================
+         REGISTER USER
+      ========================================= */
+
       if (
         request.method === "POST" &&
         url.pathname === "/api/users/register"
@@ -102,19 +111,27 @@ export class FutbolXUserRegistry extends DurableObject {
           }, 400);
         }
 
-        const cleanName =
+        /*
+         * Futbolx is reserved.
+         * Nobody can register it through the public endpoint.
+         */
+        if (
           requestedUsername.toLowerCase() === "futbolx"
-            ? "Futbolx"
-            : requestedUsername;
+        ) {
+          return this.json({
+            error: "That username is reserved."
+          }, 403);
+        }
 
         /* Check username */
+
         const existingUser =
           this.sql.exec(`
             SELECT username
             FROM profiles
             WHERE lower(username) = lower(?)
             LIMIT 1
-          `, cleanName).toArray();
+          `, requestedUsername).toArray();
 
         if (existingUser.length) {
           return this.json({
@@ -123,6 +140,7 @@ export class FutbolXUserRegistry extends DurableObject {
         }
 
         /* Maximum 3 accounts per IP */
+
         if (deviceIP) {
 
           const result =
@@ -143,6 +161,10 @@ export class FutbolXUserRegistry extends DurableObject {
           }
         }
 
+        /*
+         * IMPORTANT:
+         * Public registration NEVER creates an owner/mod.
+         */
         this.sql.exec(`
           INSERT INTO profiles (
             username,
@@ -153,7 +175,7 @@ export class FutbolXUserRegistry extends DurableObject {
           )
           VALUES (?, ?, 0, 0, 0)
         `,
-          cleanName,
+          requestedUsername,
           deviceIP
         );
 
@@ -169,7 +191,7 @@ export class FutbolXUserRegistry extends DurableObject {
             FROM profiles
             WHERE username = ?
             LIMIT 1
-          `, cleanName).toArray()[0];
+          `, requestedUsername).toArray()[0];
 
         return this.json({
           success: true,
@@ -177,7 +199,11 @@ export class FutbolXUserRegistry extends DurableObject {
         }, 201);
       }
 
-      /* Get all members */
+
+      /* =========================================
+         GET ALL MEMBERS
+      ========================================= */
+
       if (
         request.method === "GET" &&
         url.pathname === "/api/users/members"
@@ -201,6 +227,105 @@ export class FutbolXUserRegistry extends DurableObject {
         });
       }
 
+
+      /* =========================================
+         MUTE / UNMUTE USER
+      ========================================= */
+
+      if (
+        request.method === "POST" &&
+        url.pathname === "/api/users/mute"
+      ) {
+
+        const body = await request.json();
+
+        const username =
+          String(body.username || "").trim();
+
+        const muted =
+          body.is_muted === true;
+
+        if (!username) {
+          return this.json({
+            error: "Username required"
+          }, 400);
+        }
+
+        const result =
+          this.sql.exec(`
+            UPDATE profiles
+            SET is_muted = ?
+            WHERE lower(username) = lower(?)
+          `,
+            muted ? 1 : 0,
+            username
+          );
+
+        if (result.rowsWritten === 0) {
+          return this.json({
+            error: "User not found"
+          }, 404);
+        }
+
+        return this.json({
+          success: true,
+          username,
+          is_muted: muted
+        });
+      }
+
+
+      /* =========================================
+         MAKE / REMOVE MOD
+      ========================================= */
+
+      if (
+        request.method === "POST" &&
+        url.pathname === "/api/users/mod"
+      ) {
+
+        const body = await request.json();
+
+        const username =
+          String(body.username || "").trim();
+
+        const isMod =
+          body.is_mod === true;
+
+        if (!username) {
+          return this.json({
+            error: "Username required"
+          }, 400);
+        }
+
+        const result =
+          this.sql.exec(`
+            UPDATE profiles
+            SET is_mod = ?
+            WHERE lower(username) = lower(?)
+          `,
+            isMod ? 1 : 0,
+            username
+          );
+
+        if (result.rowsWritten === 0) {
+          return this.json({
+            error: "User not found"
+          }, 404);
+        }
+
+        return this.json({
+          success: true,
+          username,
+          is_mod: isMod
+        });
+      }
+
+
+      /* =========================================
+         UNKNOWN ENDPOINT
+      ========================================= */
+
       return this.json({
         error: "Unknown user endpoint"
       }, 404);
@@ -218,6 +343,7 @@ export class FutbolXUserRegistry extends DurableObject {
     }
   }
 
+
   json(data, status = 200) {
 
     return new Response(
@@ -226,9 +352,12 @@ export class FutbolXUserRegistry extends DurableObject {
         status,
         headers: {
           "Content-Type": "application/json",
-          "Cache-Control": "no-store"
+          "Cache-Control": "no-store",
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
         }
       }
     );
   }
-    }
+}
