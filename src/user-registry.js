@@ -50,27 +50,17 @@ export class FutbolXUserRegistry extends DurableObject {
           }, 400);
         }
 
-        const rows = this.sql.exec(`
-          SELECT
-            username,
-            device_ip,
-            is_owner,
-            is_mod,
-            is_muted,
-            created_at
-          FROM profiles
-          WHERE lower(username) = lower(?)
-          LIMIT 1
-        `, username).toArray();
+        const profile =
+          this.getProfile(username);
 
         return this.json({
-          profile: rows[0] || null
+          profile
         });
       }
 
 
       /* =========================================
-         REGISTER USER
+         REGISTER NEW USER
       ========================================= */
 
       if (
@@ -78,7 +68,7 @@ export class FutbolXUserRegistry extends DurableObject {
         url.pathname === "/api/users/register"
       ) {
 
-        const body = await request.json();
+        const body = await this.readJSON(request);
 
         const requestedUsername =
           String(body.username || "").trim();
@@ -112,8 +102,9 @@ export class FutbolXUserRegistry extends DurableObject {
         }
 
         /*
-         * Futbolx is reserved.
-         * Nobody can register it through the public endpoint.
+         * Futbolx is the protected owner account.
+         * It can ONLY be created through the owner
+         * bootstrap endpoint below.
          */
         if (
           requestedUsername.toLowerCase() === "futbolx"
@@ -122,8 +113,6 @@ export class FutbolXUserRegistry extends DurableObject {
             error: "That username is reserved."
           }, 403);
         }
-
-        /* Check username */
 
         const existingUser =
           this.sql.exec(`
@@ -139,8 +128,9 @@ export class FutbolXUserRegistry extends DurableObject {
           }, 409);
         }
 
-        /* Maximum 3 accounts per IP */
-
+        /*
+         * Maximum 3 accounts per IP.
+         */
         if (deviceIP) {
 
           const result =
@@ -162,8 +152,8 @@ export class FutbolXUserRegistry extends DurableObject {
         }
 
         /*
-         * IMPORTANT:
-         * Public registration NEVER creates an owner/mod.
+         * Public registration can NEVER
+         * create an owner or moderator.
          */
         this.sql.exec(`
           INSERT INTO profiles (
@@ -180,18 +170,7 @@ export class FutbolXUserRegistry extends DurableObject {
         );
 
         const profile =
-          this.sql.exec(`
-            SELECT
-              username,
-              device_ip,
-              is_owner,
-              is_mod,
-              is_muted,
-              created_at
-            FROM profiles
-            WHERE username = ?
-            LIMIT 1
-          `, requestedUsername).toArray()[0];
+          this.getProfile(requestedUsername);
 
         return this.json({
           success: true,
@@ -201,8 +180,89 @@ export class FutbolXUserRegistry extends DurableObject {
 
 
       /* =========================================
-         GET ALL MEMBERS
+         BOOTSTRAP FUTBOLX OWNER
+         
+         This is protected by OWNER_SETUP_TOKEN.
+         
+         Body:
+         {
+           "username": "Futbolx",
+           "device_ip": "...",
+           "setup_token": "..."
+         }
+         
+         This endpoint only creates the owner if
+         Futbolx does not already exist.
       ========================================= */
+
+      if (
+        request.method === "POST" &&
+        url.pathname === "/api/users/bootstrap-owner"
+      ) {
+
+        const body = await this.readJSON(request);
+
+        const setupToken =
+          String(body.setup_token || "").trim();
+
+        const expectedToken =
+          String(this.env.OWNER_SETUP_TOKEN || "").trim();
+
+        if (
+          !expectedToken ||
+          !setupToken ||
+          setupToken !== expectedToken
+        ) {
+          return this.json({
+            error: "Unauthorized"
+          }, 401);
+        }
+
+        const ownerUsername = "Futbolx";
+
+        const existingOwner =
+          this.getProfile(ownerUsername);
+
+        if (existingOwner) {
+          return this.json({
+            error: "Owner account already exists",
+            profile: existingOwner
+          }, 409);
+        }
+
+        const deviceIP =
+          String(body.device_ip || "").trim();
+
+        this.sql.exec(`
+          INSERT INTO profiles (
+            username,
+            device_ip,
+            is_owner,
+            is_mod,
+            is_muted
+          )
+          VALUES (?, ?, 1, 0, 0)
+        `,
+          ownerUsername,
+          deviceIP
+        );
+
+        const profile =
+          this.getProfile(ownerUsername);
+
+        return this.json({
+          success: true,
+          message: "Futbolx owner account created.",
+          profile
+        }, 201);
+      }
+
+
+      /* =========================================
+         GET ALL MEMBERS
+         
+         This is used by the admin panel.
+         ========================================= */
 
       if (
         request.method === "GET" &&
@@ -230,6 +290,16 @@ export class FutbolXUserRegistry extends DurableObject {
 
       /* =========================================
          MUTE / UNMUTE USER
+         
+         Body:
+         {
+           "requester": "Futbolx",
+           "username": "SomeUser",
+           "is_muted": true
+         }
+         
+         Owner or moderator may mute/unmute.
+         A moderator cannot modify the owner.
       ========================================= */
 
       if (
@@ -237,7 +307,10 @@ export class FutbolXUserRegistry extends DurableObject {
         url.pathname === "/api/users/mute"
       ) {
 
-        const body = await request.json();
+        const body = await this.readJSON(request);
+
+        const requester =
+          String(body.requester || "").trim();
 
         const username =
           String(body.username || "").trim();
@@ -245,38 +318,93 @@ export class FutbolXUserRegistry extends DurableObject {
         const muted =
           body.is_muted === true;
 
+        if (!requester) {
+          return this.json({
+            error: "Requester required"
+          }, 400);
+        }
+
         if (!username) {
           return this.json({
             error: "Username required"
           }, 400);
         }
 
-        const result =
-          this.sql.exec(`
-            UPDATE profiles
-            SET is_muted = ?
-            WHERE lower(username) = lower(?)
-          `,
-            muted ? 1 : 0,
-            username
-          );
+        const requesterProfile =
+          this.getProfile(requester);
 
-        if (result.rowsWritten === 0) {
+        if (!requesterProfile) {
+          return this.json({
+            error: "Requester not found"
+          }, 401);
+        }
+
+        const requesterIsOwner =
+          !!requesterProfile.is_owner;
+
+        const requesterIsMod =
+          !!requesterProfile.is_mod;
+
+        if (
+          !requesterIsOwner &&
+          !requesterIsMod
+        ) {
+          return this.json({
+            error: "Not authorized"
+          }, 403);
+        }
+
+        const targetProfile =
+          this.getProfile(username);
+
+        if (!targetProfile) {
           return this.json({
             error: "User not found"
           }, 404);
         }
 
+        /*
+         * Moderators cannot mute the owner.
+         */
+        if (
+          targetProfile.is_owner &&
+          !requesterIsOwner
+        ) {
+          return this.json({
+            error: "Only the owner can modify the owner."
+          }, 403);
+        }
+
+        this.sql.exec(`
+          UPDATE profiles
+          SET is_muted = ?
+          WHERE lower(username) = lower(?)
+        `,
+          muted ? 1 : 0,
+          username
+        );
+
+        const updatedProfile =
+          this.getProfile(username);
+
         return this.json({
           success: true,
-          username,
-          is_muted: muted
+          profile: updatedProfile
         });
       }
 
 
       /* =========================================
          MAKE / REMOVE MOD
+         
+         Body:
+         {
+           "requester": "Futbolx",
+           "username": "SomeUser",
+           "is_mod": true
+         }
+         
+         ONLY the owner can change moderator status.
       ========================================= */
 
       if (
@@ -284,7 +412,10 @@ export class FutbolXUserRegistry extends DurableObject {
         url.pathname === "/api/users/mod"
       ) {
 
-        const body = await request.json();
+        const body = await this.readJSON(request);
+
+        const requester =
+          String(body.requester || "").trim();
 
         const username =
           String(body.username || "").trim();
@@ -292,32 +423,112 @@ export class FutbolXUserRegistry extends DurableObject {
         const isMod =
           body.is_mod === true;
 
+        if (!requester) {
+          return this.json({
+            error: "Requester required"
+          }, 400);
+        }
+
         if (!username) {
           return this.json({
             error: "Username required"
           }, 400);
         }
 
-        const result =
-          this.sql.exec(`
-            UPDATE profiles
-            SET is_mod = ?
-            WHERE lower(username) = lower(?)
-          `,
-            isMod ? 1 : 0,
-            username
-          );
+        const requesterProfile =
+          this.getProfile(requester);
 
-        if (result.rowsWritten === 0) {
+        if (!requesterProfile) {
+          return this.json({
+            error: "Requester not found"
+          }, 401);
+        }
+
+        /*
+         * ONLY owner can create/remove moderators.
+         */
+        if (!requesterProfile.is_owner) {
+          return this.json({
+            error:
+              "Only the owner can change moderator status."
+          }, 403);
+        }
+
+        const targetProfile =
+          this.getProfile(username);
+
+        if (!targetProfile) {
           return this.json({
             error: "User not found"
           }, 404);
         }
 
+        /*
+         * Futbolx remains owner and does not become
+         * a normal moderator.
+         */
+        if (targetProfile.is_owner) {
+          return this.json({
+            error:
+              "The owner account cannot be changed."
+          }, 403);
+        }
+
+        this.sql.exec(`
+          UPDATE profiles
+          SET is_mod = ?
+          WHERE lower(username) = lower(?)
+        `,
+          isMod ? 1 : 0,
+          username
+        );
+
+        const updatedProfile =
+          this.getProfile(username);
+
         return this.json({
           success: true,
-          username,
-          is_mod: isMod
+          profile: updatedProfile
+        });
+      }
+
+
+      /* =========================================
+         INTERNAL ROLE CHECK
+         
+         ChatRoom will use this endpoint to verify
+         a username before allowing privileged actions.
+         
+         Same as /profile, kept as a clear server API.
+      ========================================= */
+
+      if (
+        request.method === "GET" &&
+        url.pathname === "/api/users/verify"
+      ) {
+
+        const username =
+          url.searchParams.get("username")?.trim();
+
+        if (!username) {
+          return this.json({
+            error: "Username required"
+          }, 400);
+        }
+
+        const profile =
+          this.getProfile(username);
+
+        if (!profile) {
+          return this.json({
+            valid: false,
+            profile: null
+          });
+        }
+
+        return this.json({
+          valid: true,
+          profile
         });
       }
 
@@ -344,6 +555,61 @@ export class FutbolXUserRegistry extends DurableObject {
   }
 
 
+  /* =========================================
+     GET PROFILE
+  ========================================= */
+
+  getProfile(username) {
+
+    const rows =
+      this.sql.exec(`
+        SELECT
+          username,
+          device_ip,
+          is_owner,
+          is_mod,
+          is_muted,
+          created_at
+        FROM profiles
+        WHERE lower(username) = lower(?)
+        LIMIT 1
+      `, username).toArray();
+
+    if (!rows.length) {
+      return null;
+    }
+
+    const row = rows[0];
+
+    return {
+      username: row.username,
+      device_ip: row.device_ip,
+      is_owner: !!row.is_owner,
+      is_mod: !!row.is_mod,
+      is_muted: !!row.is_muted,
+      created_at: row.created_at
+    };
+  }
+
+
+  /* =========================================
+     SAFE JSON BODY READER
+  ========================================= */
+
+  async readJSON(request) {
+
+    try {
+      return await request.json();
+    } catch {
+      throw new Error("Invalid JSON body");
+    }
+  }
+
+
+  /* =========================================
+     JSON RESPONSE
+  ========================================= */
+
   json(data, status = 200) {
 
     return new Response(
@@ -354,10 +620,12 @@ export class FutbolXUserRegistry extends DurableObject {
           "Content-Type": "application/json",
           "Cache-Control": "no-store",
           "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
+          "Access-Control-Allow-Headers":
+            "Content-Type, Authorization",
+          "Access-Control-Allow-Methods":
+            "GET, POST, PUT, DELETE, OPTIONS"
         }
       }
     );
   }
-}
+      }
